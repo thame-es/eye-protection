@@ -912,13 +912,19 @@
         settings: this.settings,
         lastUpdated: new Date().toISOString()
     };
-    
+
     // Always save to localStorage as fallback
     localStorage.setItem('eyeProtectionData', JSON.stringify(data));
-    
-    if (this.storage) {
+
+    if (!this.storage || !this.storage.token) {
+        this.showNotification('Saved locally (no cloud token configured)', 'warning');
+        return;
+    }
+
+    try {
+        // First try to get the existing file to obtain SHA (if it exists)
+        let sha = null;
         try {
-            // First try to get the file to check if it exists
             const getResponse = await fetch(
                 `${this.storage.baseUrl}/repos/${this.storage.repoOwner}/${this.storage.repoName}/contents/${this.storage.dataFilePath}`,
                 {
@@ -929,46 +935,51 @@
                 }
             );
 
-            let sha = null;
-            if (getResponse.status === 200) {
+            if (getResponse.ok) {
                 const fileInfo = await getResponse.json();
                 sha = fileInfo.sha;
             } else if (getResponse.status !== 404) {
-                // If it's not a 404, throw the error
                 throw new Error(`GitHub API error: ${getResponse.status}`);
             }
-
-            // Create or update the file
-            const updateResponse = await fetch(
-                `${this.storage.baseUrl}/repos/${this.storage.repoOwner}/${this.storage.repoName}/contents/${this.storage.dataFilePath}`,
-                {
-                    method: 'PUT',
-                    headers: {
-                        'Authorization': `token ${this.storage.token}`,
-                        'Accept': 'application/vnd.github.v3+json',
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        message: 'Update eye protection data',
-                        content: btoa(unescape(encodeURIComponent(JSON.stringify(data)))),
-                        sha: sha // Will be null for new file creation
-                    })
-                }
-            );
-
-            if (!updateResponse.ok) {
-                throw new Error(`Failed to update file: ${updateResponse.status}`);
-            }
-
-            const result = await updateResponse.json();
-            this.showNotification('Data successfully saved to cloud', 'success');
-            return result;
-            
-        } catch (error) {
-            console.error('GitHub sync error:', error);
-            this.showNotification('Saved locally (cloud sync failed: ' + error.message, 'warning');
-            throw error;
+        } catch (getError) {
+            console.warn('Failed to check existing file:', getError);
+            // Continue anyway - we'll try to create new file
         }
+
+        // Prepare the update
+        const updateData = {
+            message: 'Update eye protection data',
+            content: btoa(unescape(encodeURIComponent(JSON.stringify(data)))),
+            sha: sha // Will be null for new files
+            };
+
+        // Attempt to create/update the file
+        const updateResponse = await fetch(
+            `${this.storage.baseUrl}/repos/${this.storage.repoOwner}/${this.storage.repoName}/contents/${this.storage.dataFilePath}`,
+            {
+                method: 'PUT',
+                headers: {
+                    'Authorization': `token ${this.storage.token}`,
+                    'Accept': 'application/vnd.github.v3+json',
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(updateData)
+            }
+        );
+
+        if (!updateResponse.ok) {
+            const errorData = await updateResponse.json().catch(() => ({}));
+            throw new Error(`Failed to save: ${updateResponse.status} - ${errorData.message || 'Unknown error'}`);
+        }
+
+        this.showNotification('Data successfully saved to cloud', 'success');
+        return await updateResponse.json();
+        
+    } catch (error) {
+        console.error('Cloud save failed:', error);
+        this.showNotification(`Saved locally (cloud error: ${error.message})`, 'warning');
+        // Still throw the error so calling code knows it failed
+        throw error;
     }
 }
 
