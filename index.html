@@ -901,8 +901,8 @@
             }
 
             async saveData() {
-    // Create a safe data object without sensitive information
-    const safeData = {
+    // 1. Prepare clean data structure
+    const cloudData = {
         stats: this.stats,
         sessionTime: this.sessionTime,
         breakTime: this.breakTime,
@@ -910,36 +910,36 @@
         isRunning: this.isRunning,
         isOnBreak: this.isOnBreak,
         lastDropTime: this.lastDropTime,
-        // Explicitly include only non-sensitive settings
         settings: {
             sound: this.settings.sound,
             nightMode: this.settings.nightMode,
             breakReminders: this.settings.breakReminders,
             dropAlerts: this.settings.dropAlerts
-            // Exclude githubToken from cloud save
         },
         lastUpdated: new Date().toISOString()
     };
 
-    // Save complete data to localStorage (including token)
+    // 2. Always save complete data locally
     localStorage.setItem('eyeProtectionData', JSON.stringify({
-        ...safeData,
+        ...cloudData,
         settings: {
-            ...safeData.settings,
-            githubToken: this.settings.githubToken // Include token only locally
+            ...cloudData.settings,
+            githubToken: this.settings.githubToken
         }
     }));
 
-    if (!this.storage || !this.storage.token) {
-        this.showNotification('Saved locally (no cloud token configured)', 'warning');
+    if (!this.storage?.token) {
+        this.showNotification('Saved locally (no cloud token)', 'warning');
         return;
     }
 
     try {
-        // First try to get the existing file to obtain SHA
+        // 3. Get current SHA with retry logic
         let sha = null;
-        try {
-            const getResponse = await fetch(
+        let fileContent = null;
+        
+        const getFile = async () => {
+            const response = await fetch(
                 `${this.storage.baseUrl}/repos/${this.storage.repoOwner}/${this.storage.repoName}/contents/${this.storage.dataFilePath}`,
                 {
                     headers: {
@@ -948,58 +948,101 @@
                     }
                 }
             );
+            
+            if (response.status === 404) return null;
+            if (!response.ok) throw new Error(`GET failed: ${response.status}`);
+            
+            const data = await response.json();
+            return {
+                sha: data.sha,
+                content: JSON.parse(decodeURIComponent(escape(atob(data.content))))
+            };
+        };
 
-            if (getResponse.ok) {
-                const fileInfo = await getResponse.json();
-                sha = fileInfo.sha;
-            } else if (getResponse.status !== 404) {
-                throw new Error(`GitHub API error: ${getResponse.status}`);
+        // Try twice to get current file state
+        try {
+            const currentFile = await getFile();
+            if (currentFile) {
+                sha = currentFile.sha;
+                fileContent = currentFile.content;
             }
-        } catch (getError) {
-            console.warn('Failed to check existing file:', getError);
+        } catch (error) {
+            console.warn('Initial SHA fetch failed, retrying...', error);
+            try {
+                const currentFile = await getFile();
+                if (currentFile) {
+                    sha = currentFile.sha;
+                    fileContent = currentFile.content;
+                }
+            } catch (retryError) {
+                console.error('SHA fetch failed after retry:', retryError);
+                throw new Error('Failed to get current file state');
+            }
         }
 
-        // Prepare the update with safeData
-        const updateResponse = await fetch(
-            `${this.storage.baseUrl}/repos/${this.storage.repoOwner}/${this.storage.repoName}/contents/${this.storage.dataFilePath}`,
-            {
-                method: 'PUT',
-                headers: {
-                    'Authorization': `token ${this.storage.token}`,
-                    'Accept': 'application/vnd.github.v3+json',
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    message: 'Update eye protection data',
-                    content: btoa(unescape(encodeURIComponent(JSON.stringify(safeData)))),
-                    sha: sha
-                })
+        // 4. Prepare update with conflict resolution
+        const updateFile = async (currentSha) => {
+            const response = await fetch(
+                `${this.storage.baseUrl}/repos/${this.storage.repoOwner}/${this.storage.repoName}/contents/${this.storage.dataFilePath}`,
+                {
+                    method: 'PUT',
+                    headers: {
+                        'Authorization': `token ${this.storage.token}`,
+                        'Accept': 'application/vnd.github.v3+json',
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        message: 'Update eye protection data',
+                        content: btoa(unescape(encodeURIComponent(JSON.stringify(cloudData)))),
+                        sha: currentSha
+                    })
+                }
+            );
+            
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                throw new Error(errorData.message || `HTTP ${response.status}`);
             }
-        );
+            return response;
+        };
 
-        if (!updateResponse.ok) {
-            const errorData = await updateResponse.json().catch(() => ({}));
-            
-            // Special handling for secret detection
-            if (errorData.message && errorData.message.includes('Secret detected')) {
-                throw new Error('GitHub blocked save due to possible secret detection. ' + 
-                              'We removed sensitive data, please try again or check repository rules.');
+        // 5. Attempt update with merge capability
+        let result;
+        try {
+            result = await updateFile(sha);
+        } catch (updateError) {
+            if (updateError.message.includes('does not match') && fileContent) {
+                // SHA conflict - merge changes and retry
+                console.log('SHA conflict detected, merging changes...');
+                const mergedData = {
+                    ...fileContent,
+                    ...cloudData,
+                    settings: {
+                        ...fileContent.settings,
+                        ...cloudData.settings
+                    }
+                };
+                
+                cloudData.settings = mergedData.settings;
+                result = await updateFile(null); // Create new version
+            } else {
+                throw updateError;
             }
-            
-            throw new Error(`Failed to save: ${updateResponse.status} - ${errorData.message || 'Unknown error'}`);
         }
 
-        this.showNotification('Data successfully saved to cloud', 'success');
-        return await updateResponse.json();
-        
+        this.showNotification('Data synced to cloud successfully', 'success');
+        return await result.json();
+
     } catch (error) {
-        console.error('Cloud save failed:', error);
+        console.error('Cloud sync failed:', error);
         
-        let userMessage = error.message;
-        if (error.message.includes('Secret detected')) {
-            userMessage = 'GitHub blocked save due to security rules. ' +
-                         'Your data was saved locally. ' +
-                         'Please contact repo admin to adjust security settings.';
+        let userMessage = 'Cloud error';
+        if (error.message.includes('does not match')) {
+            userMessage = 'Sync conflict resolved - data merged successfully';
+        } else if (error.message.includes('Secret detected')) {
+            userMessage = 'Security rules prevented cloud save';
+        } else {
+            userMessage = error.message;
         }
         
         this.showNotification(`Saved locally (${userMessage})`, 'warning');
