@@ -901,7 +901,8 @@
             }
 
             async saveData() {
-    const data = {
+    // Create a safe data object without sensitive information
+    const safeData = {
         stats: this.stats,
         sessionTime: this.sessionTime,
         breakTime: this.breakTime,
@@ -909,12 +910,25 @@
         isRunning: this.isRunning,
         isOnBreak: this.isOnBreak,
         lastDropTime: this.lastDropTime,
-        settings: this.settings,
+        // Explicitly include only non-sensitive settings
+        settings: {
+            sound: this.settings.sound,
+            nightMode: this.settings.nightMode,
+            breakReminders: this.settings.breakReminders,
+            dropAlerts: this.settings.dropAlerts
+            // Exclude githubToken from cloud save
+        },
         lastUpdated: new Date().toISOString()
     };
 
-    // Always save to localStorage as fallback
-    localStorage.setItem('eyeProtectionData', JSON.stringify(data));
+    // Save complete data to localStorage (including token)
+    localStorage.setItem('eyeProtectionData', JSON.stringify({
+        ...safeData,
+        settings: {
+            ...safeData.settings,
+            githubToken: this.settings.githubToken // Include token only locally
+        }
+    }));
 
     if (!this.storage || !this.storage.token) {
         this.showNotification('Saved locally (no cloud token configured)', 'warning');
@@ -922,7 +936,7 @@
     }
 
     try {
-        // First try to get the existing file to obtain SHA (if it exists)
+        // First try to get the existing file to obtain SHA
         let sha = null;
         try {
             const getResponse = await fetch(
@@ -943,17 +957,9 @@
             }
         } catch (getError) {
             console.warn('Failed to check existing file:', getError);
-            // Continue anyway - we'll try to create new file
         }
 
-        // Prepare the update
-        const updateData = {
-            message: 'Update eye protection data',
-            content: btoa(unescape(encodeURIComponent(JSON.stringify(data)))),
-            sha: sha // Will be null for new files
-            };
-
-        // Attempt to create/update the file
+        // Prepare the update with safeData
         const updateResponse = await fetch(
             `${this.storage.baseUrl}/repos/${this.storage.repoOwner}/${this.storage.repoName}/contents/${this.storage.dataFilePath}`,
             {
@@ -963,12 +969,23 @@
                     'Accept': 'application/vnd.github.v3+json',
                     'Content-Type': 'application/json'
                 },
-                body: JSON.stringify(updateData)
+                body: JSON.stringify({
+                    message: 'Update eye protection data',
+                    content: btoa(unescape(encodeURIComponent(JSON.stringify(safeData)))),
+                    sha: sha
+                })
             }
         );
 
         if (!updateResponse.ok) {
             const errorData = await updateResponse.json().catch(() => ({}));
+            
+            // Special handling for secret detection
+            if (errorData.message && errorData.message.includes('Secret detected')) {
+                throw new Error('GitHub blocked save due to possible secret detection. ' + 
+                              'We removed sensitive data, please try again or check repository rules.');
+            }
+            
             throw new Error(`Failed to save: ${updateResponse.status} - ${errorData.message || 'Unknown error'}`);
         }
 
@@ -977,8 +994,15 @@
         
     } catch (error) {
         console.error('Cloud save failed:', error);
-        this.showNotification(`Saved locally (cloud error: ${error.message})`, 'warning');
-        // Still throw the error so calling code knows it failed
+        
+        let userMessage = error.message;
+        if (error.message.includes('Secret detected')) {
+            userMessage = 'GitHub blocked save due to security rules. ' +
+                         'Your data was saved locally. ' +
+                         'Please contact repo admin to adjust security settings.';
+        }
+        
+        this.showNotification(`Saved locally (${userMessage})`, 'warning');
         throw error;
     }
 }
